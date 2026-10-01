@@ -12,3 +12,6 @@ __pycache__/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 含个人保险库 token 的中继（仅本机用，不公开）
+gemini-relay.py

@@ -8,6 +8,7 @@
 以 root 经 systemd 运行，需读写 config.yaml/.env/data 并 systemctl 重启服务。
 """
 import base64
+import hashlib
 import html
 import json
 import os
@@ -17,6 +18,7 @@ import signal
 import subprocess
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -218,11 +220,8 @@ def get_owner_names():
 
 def _room_info_refresher():
     """后台刷新各房间信息：主播名 + 开播状态（show_status==1 为直播中）。
-    注意 egress 代理对斗鱼高频建连限流，每次请求间隔 55s 以上；
+    经 _douyu_request 统一限流（与取流共享 55s 间隔）；
     结果落盘缓存（room_names.json / room_status.json），重启不丢失。"""
-    import os as _os
-    proxy = _os.environ.get("PROXY_URL", "").strip()
-    proxies = {"http": proxy, "https": proxy} if proxy else {}
     while True:
         try:
             ids = [str(r.get("id", "")) for r in load_bot_config().get("rooms", [])]
@@ -230,9 +229,7 @@ def _room_info_refresher():
                 if not rid:
                     continue
                 try:
-                    r = requests.get(f"https://www.douyu.com/betard/{rid}",
-                                     headers={"User-Agent": UA_WEB},
-                                     proxies=proxies, timeout=20)
+                    r = _douyu_request("GET", f"https://www.douyu.com/betard/{rid}")
                     room = r.json().get("room") or {}
                     name = (room.get("owner_name") or "").strip()
                     live = room.get("show_status") == 1
@@ -248,7 +245,6 @@ def _room_info_refresher():
                         ROOM_STATUS_FILE.write_text(json.dumps(st), encoding="utf-8")
                 except Exception:
                     pass
-                time.sleep(55)
         except Exception:
             pass
         time.sleep(60)
@@ -259,6 +255,122 @@ def get_room_status():
         return json.loads(ROOM_STATUS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+# ---------- 斗鱼取流（供“实时监看”用）：getEncryption + 签名 + getH5PlayV1 ----------
+# 浏览器直接播后端返回的流地址（HLS 优先），视频走浏览器→斗鱼 CDN，不经过本服务转发。
+WATCH_QN = {"原画": "0", "蓝光": "8", "超清": "4", "高清": "3", "流畅": "2"}
+DOUYU_DID = "10000000000000000000000000001501"
+_douyu_gate = threading.Lock()
+_douyu_next_ok = 0.0  # www.douyu.com 下次允许请求的时间戳（与房间信息刷新共享 55s 间隔）
+_stream_cache = {}    # (rid, qn) -> {"url","kind","ts"}，流地址约 300s 过期
+_stream_lock = threading.Lock()
+_watch_quality = "超清"
+_watch_heartbeat = 0.0  # 前端监看页心跳，90s 内有效时才取流（没人看就不浪费请求额度）
+
+
+def _douyu_request(method, url, **kw):
+    """www.douyu.com 统一出口：全局串行 + 每次间隔 55s 以上（egress 代理高频限流）。"""
+    global _douyu_next_ok
+    with _douyu_gate:
+        wait = _douyu_next_ok - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        proxy = os.environ.get("PROXY_URL", "").strip()
+        kw.setdefault("proxies", {"http": proxy, "https": proxy} if proxy else {})
+        hdrs = kw.setdefault("headers", {})
+        hdrs.setdefault("User-Agent", UA_WEB)
+        kw.setdefault("timeout", 20)
+        try:
+            return requests.request(method, url, **kw)
+        finally:
+            _douyu_next_ok = time.time() + 55
+
+
+def _douyu_stream_sign(rid, ts, key, rand_str, enc_time, is_special):
+    f = rand_str
+    for _ in range(enc_time):
+        f = hashlib.md5((f + key).encode()).hexdigest()
+    suffix = "" if is_special == 1 else f"{rid}{ts}"
+    return hashlib.md5((f + key + suffix).encode()).hexdigest()
+
+
+def resolve_stream_url(rid, qn="超清"):
+    """取房间可播流地址，优先 HLS。返回 {"url","kind","ts"} 或 {"error":...}。
+    斗鱼经 egress 代理偶发 RST，失败自动重试 3 次（_douyu_request 自带 55s 间隔）。"""
+    key = (str(rid), qn)
+    with _stream_lock:
+        c = _stream_cache.get(key)
+        if c and time.time() - c["ts"] < 240:
+            return c
+    last_err = "未知错误"
+    for attempt in range(3):
+        try:
+            r = _douyu_request(
+                "GET",
+                f"https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did={DOUYU_DID}")
+            j = r.json()
+            if j.get("error") != 0 or not j.get("data"):
+                last_err = "getEncryption 失败"
+                continue
+            d = j["data"]
+            try:
+                ts = int(parsedate_to_datetime(r.headers.get("Date", "")).timestamp())
+            except Exception:
+                ts = int(time.time())
+        except Exception as e:
+            last_err = f"getEncryption 异常: {type(e).__name__}"
+            continue
+        auth = _douyu_stream_sign(str(rid), ts, d["key"], d["rand_str"],
+                                  d["enc_time"], d["is_special"])
+        try:
+            r = _douyu_request("POST", f"https://www.douyu.com/lapi/live/getH5PlayV1/{rid}", data={
+                "enc_data": d["enc_data"], "tt": str(ts), "did": DOUYU_DID, "auth": auth,
+                "cdn": "", "rate": WATCH_QN.get(qn, "4"),
+                "hevc": "0", "fa": "0", "ive": "0"})
+            j = r.json()
+        except Exception as e:
+            last_err = f"getH5PlayV1 异常: {type(e).__name__}"
+            continue
+        if j.get("error") != 0 or not j.get("data"):
+            last_err = f"取流失败: {str(j)[:100]}"
+            continue
+        dd = j["data"]
+        if dd.get("hls_url") and dd.get("hls_live"):
+            url, kind = dd["hls_url"] + "/" + dd["hls_live"], "hls"
+        elif dd.get("rtmp_url") and dd.get("rtmp_live"):
+            url, kind = dd["rtmp_url"] + "/" + dd["rtmp_live"], "flv"
+        else:
+            last_err = "无可用流地址"
+            continue
+        item = {"url": url, "kind": kind, "ts": time.time()}
+        with _stream_lock:
+            _stream_cache[key] = item
+        return item
+    print(f"[webui] 取流失败 rid={rid} qn={qn}: {last_err}", flush=True)
+    return {"error": last_err}
+
+
+def _stream_refresher():
+    """有人在看时，保持各直播中房间的流地址新鲜（<240s）。"""
+    while True:
+        try:
+            if time.time() - _watch_heartbeat < 90:
+                cfg = load_bot_config()
+                status = get_room_status()
+                for r in cfg.get("rooms", []):
+                    rid = str(r.get("id", ""))
+                    if not rid or not (status.get(rid) or {}).get("live"):
+                        continue
+                    key = (rid, _watch_quality)
+                    with _stream_lock:
+                        c = _stream_cache.get(key)
+                        stale = (not c) or time.time() - c["ts"] > 240
+                    if stale:
+                        resolve_stream_url(rid, _watch_quality)
+        except Exception:
+            pass
+        time.sleep(30)
 
 
 _room_names.update(_load_room_names())
@@ -337,6 +449,8 @@ class Handler(BaseHTTPRequestHandler):
             self._api_status()
         elif path == "/api/login/poll":
             self._api_login_poll()
+        elif path == "/api/watch":
+            self._api_watch()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -356,6 +470,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_login_qr()
             elif path == "/api/service/restart":
                 self._api_restart()
+            elif path == "/api/watch":
+                self._api_watch_post()
             else:
                 self._json({"error": "not found"}, 404)
         except Exception as e:
@@ -543,6 +659,61 @@ class Handler(BaseHTTPRequestHandler):
         ok, msg = svc_restart(name)
         self._json({"ok": ok, "msg": msg})
 
+    def _api_watch(self):
+        """GET /api/watch：返回各房间直播状态 + 已缓存的流地址（不阻塞取流）。"""
+        global _watch_heartbeat
+        _watch_heartbeat = time.time()  # 顺便当心跳
+        cfg = load_bot_config()
+        status_map = get_room_status()
+        owners = get_owner_names()
+        rooms = []
+        with _stream_lock:
+            cache = dict(_stream_cache)
+        for r in cfg.get("rooms", []):
+            rid = str(r.get("id", ""))
+            st = status_map.get(rid) or {}
+            c = cache.get((rid, _watch_quality))
+            rooms.append({
+                "id": rid,
+                "owner": owners.get(rid, ""),
+                "live": st.get("live"),
+                "enabled": r.get("enabled", True) is not False,
+                "url": c["url"] if c else "",
+                "kind": c["kind"] if c else "",
+                "url_ts": c["ts"] if c else 0,
+            })
+        self._json({"rooms": rooms, "quality": _watch_quality,
+                    "qualities": list(WATCH_QN.keys())})
+
+    def _api_watch_post(self):
+        """POST /api/watch：{action: heartbeat|quality|refresh}。"""
+        global _watch_heartbeat, _watch_quality
+        body = self._read_json()
+        action = body.get("action")
+        if action == "heartbeat":
+            _watch_heartbeat = time.time()
+            return self._json({"ok": True})
+        if action == "quality":
+            q = body.get("quality", "")
+            if q not in WATCH_QN:
+                return self._json({"error": "清晰度非法"}, 400)
+            _watch_quality = q
+            with _stream_lock:
+                _stream_cache.clear()
+            _watch_heartbeat = time.time()
+            return self._json({"ok": True, "quality": q})
+        if action == "refresh":
+            rid = str(body.get("rid", ""))
+            if not rid:
+                return self._json({"error": "rid 非法"}, 400)
+            _watch_heartbeat = time.time()
+            # 异步取流：斗鱼限流下单次取流约需 2 分钟，不能阻塞 HTTP 请求；
+            # 前端轮询 /api/watch 等地址进缓存后自动挂载播放器。
+            threading.Thread(target=resolve_stream_url, args=(rid, _watch_quality),
+                             daemon=True).start()
+            return self._json({"ok": True, "pending": True})
+        return self._json({"error": "action 非法"}, 400)
+
     # ----- 前端页面 -----
     def _serve_index(self):
         page = INDEX_HTML
@@ -586,6 +757,14 @@ table.hits{width:100%;border-collapse:collapse;font-size:13px}
 table.hits td,table.hits th{border-bottom:1px solid #26314a;padding:6px 8px;text-align:left;vertical-align:top}
 table.hits th{color:#9fb0d0;font-weight:600}
 .rid{color:#7dd3fc;font-family:monospace}.tm{color:#7d8db0;font-size:12px;white-space:nowrap}
+.wgrid{display:grid;gap:10px;margin-top:8px}
+.wgrid.c1{grid-template-columns:1fr}.wgrid.c2{grid-template-columns:1fr 1fr}.wgrid.c3{grid-template-columns:1fr 1fr 1fr}
+.wtile{position:relative;background:#0b0f18;border:1px solid #2a3654;border-radius:8px;overflow:hidden;aspect-ratio:16/9;cursor:pointer}
+.wtile video{width:100%;height:100%;background:#000;display:block}
+.wtile .wtag{position:absolute;left:8px;top:6px;font-size:12px;background:rgba(0,0,0,.55);padding:2px 10px;border-radius:12px}
+.wtile .wlive{position:absolute;right:8px;top:6px;font-size:12px}
+.wtile .woff{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#7d8db0;font-size:14px}
+.wtile .werr{position:absolute;left:0;right:0;bottom:0;font-size:12px;color:#fbbf24;background:rgba(0,0,0,.6);padding:4px 8px;display:none}
 </style></head><body>
 <h1>🤖 斗鱼 AI 弹幕机器人 · 管理后台</h1>
 
@@ -597,6 +776,15 @@ table.hits th{color:#9fb0d0;font-weight:600}
 <button class="ghost" onclick="doRestart('relay')">重启中继</button>
 <button class="ghost" onclick="loadStatus()">刷新状态</button></div>
 <div class="msg" id="msg_status"></div></div>
+
+<div class="card" style="max-width:none"><h2>实时监看 <span class="hint">（与机器人同一批房间 · 视频直连斗鱼 CDN，不经过服务器转发）</span></h2>
+<div class="row"><label>布局</label><select id="w_layout" onchange="setWLayout()">
+<option value="2">2×2</option><option value="1">1×1</option><option value="3">3×3</option></select>
+<label>清晰度</label><select id="w_qn" onchange="setWQuality()"></select>
+<button class="ghost small" onclick="loadWatch(true)">刷新流地址</button>
+<span class="hint">默认静音自动播放，点击画面切换该路声音（一次只一路有声）</span></div>
+<div id="w_grid" class="wgrid c2"></div>
+<div class="msg" id="msg_watch"></div></div>
 
 <div class="card"><h2>命中记录 <span class="hint">（房间 / 发送者 / 内容）</span></h2>
 <table class="hits"><thead><tr><th>时间</th><th>房间</th><th>发送者</th><th>内容</th></tr></thead>
@@ -638,6 +826,8 @@ table.hits th{color:#9fb0d0;font-weight:600}
 <div class="row"><button class="ghost" onclick="loadStatus()">刷新</button></div>
 <div id="logs"></div></div>
 
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
 <script>
 let rooms=[];
 async function api(p,o={}){const r=await fetch(p,Object.assign({headers:{'Content-Type':'application/json'}},o));
@@ -766,6 +956,77 @@ else if(j.status==='error'){clearInterval(pollTimer);m.textContent='失败：'+j
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id.startsWith('kw_in_')){
 const i=+e.target.id.slice(6);addKw(i);}});
 loadStatus();setInterval(loadStatus,15000);
+
+// ---------- 实时监看 ----------
+let wPlayers={}, wInit=false, wSig='', wPendingRefresh={};
+function setWLayout(){const v=document.getElementById('w_layout').value;
+const g=document.getElementById('w_grid');g.className='wgrid c'+v;}
+async function ensureWUrl(rid){
+const now=Date.now();
+if(wPendingRefresh[rid]&&now-wPendingRefresh[rid]<180000)return;
+wPendingRefresh[rid]=now;
+try{await api('/api/watch',{method:'POST',body:JSON.stringify({action:'refresh',rid:String(rid)})});}catch(e){}}
+async function setWQuality(){const q=document.getElementById('w_qn').value;
+try{await api('/api/watch',{method:'POST',body:JSON.stringify({action:'quality',quality:q})});
+Object.keys(wPlayers).forEach(destroyWPlayer);wPlayers={};wSig='';loadWatch();}catch(e){
+document.getElementById('msg_watch').textContent='切换失败：'+e.message;}}
+function destroyWPlayer(rid){const p=wPlayers[rid];if(!p)return;
+try{if(p.destroy)p.destroy();}catch(e){}delete wPlayers[rid];}
+function attachWPlayer(rid,url,kind){
+const v=document.getElementById('wv_'+rid);if(!v)return;
+destroyWPlayer(rid);
+const e0=document.querySelector('#wt_'+rid+' .werr');if(e0)e0.style.display='none';
+const onFatal=()=>{const e=document.querySelector('#wt_'+rid+' .werr');
+if(e){e.style.display='block';e.textContent='流中断，正在换地址…';}
+destroyWPlayer(rid);ensureWUrl(rid);};
+if(kind==='hls'&&window.Hls&&Hls.isSupported()){
+const h=new Hls({maxBufferLength:30});wPlayers[rid]=h;
+h.on(Hls.Events.ERROR,(ev,data)=>{if(data.fatal)onFatal();});
+h.loadSource(url);h.attachMedia(v);
+}else if(kind==='flv'&&window.flvjs&&flvjs.isSupported()){
+const p=flvjs.createPlayer({type:'flv',url:url});wPlayers[rid]=p;
+p.on(flvjs.Events.ERROR,()=>onFatal());
+p.attachMediaElement(v);p.load();
+}else{v.src=url;}
+v.muted=true;v.play().catch(()=>{});}
+function focusWAudio(rid){
+document.querySelectorAll('#w_grid video').forEach(v=>{
+const id=v.id.slice(3);const on=(id===String(rid))&&v.muted;
+v.muted=!on;});}
+function renderWTiles(rooms){
+const g=document.getElementById('w_grid');
+g.innerHTML=rooms.length?rooms.map(r=>{
+const nm=r.owner||('房间 '+r.id);
+if(!r.live)return `<div class="wtile" id="wt_${r.id}"><div class="woff">${esc(nm)} · 未开播</div></div>`;
+return `<div class="wtile" id="wt_${r.id}" onclick="focusWAudio('${r.id}')">
+<video id="wv_${r.id}" playsinline></video>
+<span class="wtag">${esc(nm)}</span><span class="wlive badge ok">直播中</span>
+<div class="werr"></div></div>`;}).join('')
+:'<div class="hint">还没有房间，先在下方添加监控房间</div>';}
+function attachWPending(rooms){
+rooms.forEach(r=>{
+if(!r.live||wPlayers[r.id])return;
+if(r.url){const v=document.getElementById('wv_'+r.id);
+if(v&&!v.src&&!v.currentSrc)attachWPlayer(r.id,r.url,r.kind);}
+else ensureWUrl(r.id);});}
+async function loadWatch(force){
+try{
+if(!wInit){wInit=true;
+const q0=await api('/api/watch');const sel=document.getElementById('w_qn');
+sel.innerHTML=(q0.qualities||['超清']).map(x=>'<option'+(x===q0.quality?' selected':'')+'>'+x+'</option>').join('');}
+if(force){
+const j0=await api('/api/watch');
+for(const r of j0.rooms){if(r.live&&!wPlayers[r.id]){
+try{const jr=await api('/api/watch',{method:'POST',body:JSON.stringify({action:'refresh',rid:r.id})});
+if(jr.ok){wSig='';}}catch(e){}}}}
+const j=await api('/api/watch');
+const sig=j.rooms.map(r=>r.id+':'+(r.live?1:0)).join(',');
+if(sig!==wSig){wSig=sig;renderWTiles(j.rooms);}
+attachWPending(j.rooms);
+}catch(e){document.getElementById('msg_watch').textContent='监看加载失败：'+e.message;}
+}
+loadWatch();setInterval(loadWatch,30000);setInterval(()=>{api('/api/watch',
+{method:'POST',body:JSON.stringify({action:'heartbeat'})}).catch(()=>{});},30000);
 </script></body></html>
 """
 
@@ -776,6 +1037,7 @@ def main():
     server.webui_password = pw
     server.daemon_threads = True
     threading.Thread(target=_room_info_refresher, daemon=True).start()
+    threading.Thread(target=_stream_refresher, daemon=True).start()
     print(f"[webui] listening on 127.0.0.1:{PORT} (admin/{'*' * 8})", flush=True)
     try:
         server.serve_forever()
