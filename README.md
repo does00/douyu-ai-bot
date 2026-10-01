@@ -24,10 +24,11 @@ cp .env.example .env                 # 填 WEBUI_PASSWORD 和 GEMINI_API_KEY
 cp config.example.yaml config.yaml   # 填房间号和触发词
 mkdir -p data
 
-# 2. 启动
-docker compose up -d --build
+# 2. 启动（拉取预构建镜像，免编译）
+docker compose pull && docker compose up -d
+# 想本地编译：docker compose up -d --build
 
-# 3. 打开 Web 管理后台：http://<服务器IP>:18021（用户名 admin）
+# 3. 打开 Web 管理后台：http://<服务器IP>:8080（用户名 admin）
 #    在「账号登录」卡片用斗鱼 APP 扫码登录，即可开始收发弹幕
 
 # 看日志
@@ -42,6 +43,9 @@ cp .env.example .env && cp config.example.yaml config.yaml   # 填好
 ./venv/bin/python bot.py        # 机器人
 ./venv/bin/python webui.py      # Web 后台（另一个终端）
 ```
+
+镜像由 GitHub Actions 在每次 push 到 main 后自动构建并推送到
+`ghcr.io/does00/douyu-ai-bot`（`latest` + `sha-<短哈希>` 标签），compose 默认拉取使用。
 
 ## 配置说明
 
