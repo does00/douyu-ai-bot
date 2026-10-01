@@ -1,0 +1,14 @@
+# 运行期敏感文件
+.env
+config.yaml
+data/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统
+.DS_Store
+Thumbs.db
