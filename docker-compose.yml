@@ -1,11 +1,13 @@
 # 首次使用：
 #   1. cp .env.example .env                 # 填 WEBUI_PASSWORD 和 GEMINI_API_KEY
 #   2. cp config.example.yaml config.yaml   # 填房间号和触发词
-#   3. docker compose up -d --build
-# Web 管理后台：http://<服务器IP>:18021（用户名 admin）
+#   3. docker compose pull && docker compose up -d   # 拉取预构建镜像，免编译
+#      （想本地编译：docker compose up -d --build）
+# Web 管理后台：http://<服务器IP>:8080（用户名 admin）
 # 斗鱼扫码登录：在 WebUI「账号登录」卡片按账号扫码
 services:
   douyu-ai-bot:
+    image: ghcr.io/does00/douyu-ai-bot:latest
     build: .
     container_name: douyu-ai-bot
     restart: unless-stopped
@@ -17,6 +19,7 @@ services:
       - ./data:/app/data
 
   douyu-ai-bot-webui:
+    image: ghcr.io/does00/douyu-ai-bot:latest
     build: .
     container_name: douyu-ai-bot-webui
     restart: unless-stopped
@@ -24,10 +27,11 @@ services:
     env_file: .env
     environment:
       - WEBUI_HOST=0.0.0.0
+      - WEBUI_PORT=8080
       # 需要代理时取消注释
       # - PROXY_URL=http://127.0.0.1:8080
     ports:
-      - "18021:18021"
+      - "8080:8080"
     volumes:
       - ./config.yaml:/app/config.yaml
       - ./.env:/app/.env
