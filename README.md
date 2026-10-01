@@ -65,7 +65,7 @@ cp .env.example .env && cp config.example.yaml config.yaml   # 填好
 |---|---|
 | `rooms[].id` | 斗鱼房间号 |
 | `rooms[].mode` | `contains` 含关键词即触发；`mention` 以前缀开头才触发 |
-| `rooms[].keywords` | 触发词列表 |
+| `rooms[].keywords` | 触发词列表（可空，为空时只监控不触发 AI） |
 | `rooms[].offline_monitor` | 下播后是否继续监控（默认 true） |
 | `rooms[].enabled` | 手动启停（WebUI 可点） |
 | `accounts[]` | 发送账号列表（最多 10 个），按 round-robin 轮流发送 |
@@ -89,8 +89,10 @@ cp .env.example .env && cp config.example.yaml config.yaml   # 填好
   浏览器→斗鱼 CDN，不经过本服务器转发，服务器带宽占用可忽略
 - 自动取流：直播中的房间自动解析可播地址（HLS 优先，无 HLS 时回退 FLV），
   地址约 5 分钟过期，后台自动续取；没人看页面时不取流，不浪费请求
-- 布局 1×1 / 2×2 / 3×3 可切，清晰度 原画/蓝光/超清/高清/流畅 可选
+- 布局 1×1 / 2×2 / 3×3 / 4×4 可切（选择自动记住），清晰度 原画/蓝光/超清/高清/流畅 可选
 - 视频默认静音自动播放；点某一路画面切换为有声（同时只一路有声）
+- 每路独立音量滑杆；每路独立弹幕开关（浏览器直连斗鱼弹幕网关飘屏）
+- 每路底部可直接发弹幕（走机器人发送账号池，最多 50 字）
 - 流中断时自动换地址重连
 
 取流原理：`getEncryption` 取签名参数（时间戳用响应 `Date` 头）→
