@@ -1,0 +1,9 @@
+.git
+.gitignore
+venv/
+__pycache__/
+data/
+.env
+config.yaml
+*.md
+LICENSE
