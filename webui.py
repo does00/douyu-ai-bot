@@ -472,6 +472,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_restart()
             elif path == "/api/watch":
                 self._api_watch_post()
+            elif path == "/api/send":
+                self._api_send()
             else:
                 self._json({"error": "not found"}, 404)
         except Exception as e:
@@ -537,8 +539,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": f"房间号无效或重复: {rid}"}, 400)
                 seen.add(rid)
                 kws = [str(k).strip() for k in r.get("keywords", []) if str(k).strip()]
-                if not kws:
-                    return self._json({"error": f"房间 {rid} 至少保留一个触发词"}, 400)
+
                 mode = r.get("mode", "contains")
                 if mode not in ("contains", "mention"):
                     return self._json({"error": f"房间 {rid} mode 非法"}, 400)
@@ -685,6 +686,26 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"rooms": rooms, "quality": _watch_quality,
                     "qualities": list(WATCH_QN.keys())})
 
+    def _api_send(self):
+        """POST /api/send：{rid, text}，手动发送弹幕。"""
+        body = self._read_json()
+        rid = str(body.get("rid", "")).strip()
+        text = str(body.get("text", "")).strip()
+        if not rid or not text:
+            return self._json({"error": "缺少 rid 或 text"}, 400)
+        if len(text) > 50:
+            return self._json({"error": "弹幕太长（最多50字）"}, 400)
+        try:
+            from bot import Account, DanmakuSender
+            cfg = load_config()
+            accounts = [Account(a.get("name", "账号"), a.get("cookie_file", ""))
+                        for a in cfg.get("accounts", [])]
+            sender = DanmakuSender(accounts)
+            ok, msg = sender.send(rid, text)
+            return self._json({"ok": ok, "msg": msg or ("已发送" if ok else "发送失败")})
+        except Exception as e:
+            return self._json({"error": f"发送异常：{e}"}, 500)
+
     def _api_watch_post(self):
         """POST /api/watch：{action: heartbeat|quality|refresh}。"""
         global _watch_heartbeat, _watch_quality
@@ -749,7 +770,12 @@ button.small{padding:4px 10px;font-size:12px}
 max-height:300px;overflow:auto;color:#a8b6d0}
 #qrimg{width:220px;height:220px;background:#fff;border-radius:8px;display:none;margin:8px 0}
 .hint{font-size:12px;color:#7d8db0}.msg{font-size:13px;margin-top:8px;min-height:18px}
-.roombox{border:1px solid #2a3654;border-radius:8px;padding:10px;margin:8px 0;background:#141b2c}
+#rooms{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+#st_card .row{flex-wrap:nowrap}
+.pair-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;align-items:stretch;justify-items:stretch}
+.pair-grid>.card{margin-bottom:0 !important;min-height:100%;box-sizing:border-box;max-width:none}
+#st_card #st_detail{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.roombox{border:1px solid #2a3654;border-radius:8px;padding:10px;background:#141b2c;min-width:0}
 .roombox.paused{opacity:.55;border-style:dashed}
 .acct{display:flex;gap:8px;align-items:center;padding:8px;border:1px solid #2a3654;border-radius:8px;margin:6px 0;background:#141b2c}
 .acct .nm{font-weight:600}
@@ -758,17 +784,35 @@ table.hits td,table.hits th{border-bottom:1px solid #26314a;padding:6px 8px;text
 table.hits th{color:#9fb0d0;font-weight:600}
 .rid{color:#7dd3fc;font-family:monospace}.tm{color:#7d8db0;font-size:12px;white-space:nowrap}
 .wgrid{display:grid;gap:10px;margin-top:8px}
-.wgrid.c1{grid-template-columns:1fr}.wgrid.c2{grid-template-columns:1fr 1fr}.wgrid.c3{grid-template-columns:1fr 1fr 1fr}
-.wtile{position:relative;background:#0b0f18;border:1px solid #2a3654;border-radius:8px;overflow:hidden;aspect-ratio:16/9;cursor:pointer}
-.wtile video{width:100%;height:100%;background:#000;display:block}
+.wgrid.c1{grid-template-columns:1fr}.wgrid.c2{grid-template-columns:1fr 1fr}.wgrid.c3{grid-template-columns:1fr 1fr 1fr}.wgrid.c4{grid-template-columns:1fr 1fr 1fr 1fr}
+.wtile{position:relative;background:#0b0f18;border:1px solid #2a3654;border-radius:8px;overflow:hidden;display:flex;flex-direction:column;aspect-ratio:16/10;cursor:pointer}
+.wtile .wvid{position:relative;flex:1 1 auto;min-height:0;cursor:pointer}
+.wtile .wvid video{position:absolute;inset:0;width:100%;height:100%;background:#000;display:block;object-fit:contain}
+
 .wtile .wtag{position:absolute;left:8px;top:6px;font-size:12px;background:rgba(0,0,0,.55);padding:2px 10px;border-radius:12px}
 .wtile .wlive{position:absolute;right:8px;top:6px;font-size:12px}
 .wtile .woff{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#7d8db0;font-size:14px}
 .wtile .werr{position:absolute;left:0;right:0;bottom:0;font-size:12px;color:#fbbf24;background:rgba(0,0,0,.6);padding:4px 8px;display:none}
+.wtile .wvol{position:absolute;left:8px;bottom:8px;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.55);padding:3px 10px 3px 8px;border-radius:12px;opacity:.9;z-index:2}
+.wtile .wvol:hover{opacity:1}
+.wtile .wvol input{width:80px;margin:0;padding:0;cursor:pointer;accent-color:#7aa2ff}
+.wdmk{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:1}
+.wdmk-it{position:absolute;right:0;transform:translateX(100%);white-space:nowrap;color:#fff;font-size:15px;line-height:28px;text-shadow:0 1px 2px rgba(0,0,0,.9),0 0 6px rgba(0,0,0,.6);animation-name:wdmkfly;animation-timing-function:linear;animation-fill-mode:forwards}
+@keyframes wdmkfly{to{transform:translateX(calc(-100vw - 100%))}}
+.wtile .wbtns{position:absolute;right:8px;bottom:8px;display:flex;gap:6px;z-index:2}
+.wtile .wbtns button{background:rgba(0,0,0,.55);border:1px solid #33415c;color:#9ab8e0;border-radius:12px;padding:3px 10px;font-size:12px;cursor:pointer}
+.wtile .wbtns button:hover{border-color:#3b82f6;color:#fff}
+.wtile .wbtns button.off{opacity:.5}
+.wtile .wsend{display:flex;gap:6px;padding:6px 8px;align-items:center;background:#0e1422;border-top:1px solid #1e2a3f}
+.wtile .wsend input{flex:1;min-width:0;background:#182032;border:1px solid #2a3654;color:#dbe4ff;border-radius:6px;padding:6px 8px;font-size:13px}
+.wtile .wsend button{flex:none;background:#1e2a3f;border:1px solid #33415c;color:#cfe0ff;border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer}
+.wtile .wsend button:hover{background:#3b82f6;color:#fff}
+.wtile .wsend button:disabled{opacity:.5;cursor:default}
+.wtile .wmsg{font-size:11px;color:#7d8db0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:90px}
 </style></head><body>
 <h1>🤖 斗鱼 AI 弹幕机器人 · 管理后台</h1>
 
-<div class="card"><h2>状态</h2>
+<div class="card" style="max-width:none" id="st_card"><h2>状态</h2>
 <div class="row"><span class="badge" id="b_bot">…</span><span class="badge" id="b_relay">…</span>
 <span class="badge" id="b_ai">…</span></div>
 <div class="row hint" id="st_detail"></div>
@@ -779,18 +823,14 @@ table.hits th{color:#9fb0d0;font-weight:600}
 
 <div class="card" style="max-width:none"><h2>实时监看 <span class="hint">（与机器人同一批房间 · 视频直连斗鱼 CDN，不经过服务器转发）</span></h2>
 <div class="row"><label>布局</label><select id="w_layout" onchange="setWLayout()">
-<option value="2">2×2</option><option value="1">1×1</option><option value="3">3×3</option></select>
+<option value="2">2×2</option><option value="1">1×1</option><option value="3">3×3</option><option value="4">4×4</option></select>
 <label>清晰度</label><select id="w_qn" onchange="setWQuality()"></select>
 <button class="ghost small" onclick="loadWatch(true)">刷新流地址</button>
 <span class="hint">默认静音自动播放，点击画面切换该路声音（一次只一路有声）</span></div>
 <div id="w_grid" class="wgrid c2"></div>
 <div class="msg" id="msg_watch"></div></div>
 
-<div class="card"><h2>命中记录 <span class="hint">（房间 / 发送者 / 内容）</span></h2>
-<table class="hits"><thead><tr><th>时间</th><th>房间</th><th>发送者</th><th>内容</th></tr></thead>
-<tbody id="hits_body"><tr><td colspan="4" class="hint">加载中…</td></tr></tbody></table></div>
-
-<div class="card"><h2>监控房间 <span class="hint">（最多 10 个，每房独立触发词）</span></h2>
+<div class="card" style="max-width:none"><h2>监控房间 <span class="hint">（最多 10 个，每房独立触发词）</span></h2>
 <div id="rooms"></div>
 <div class="row"><input type="text" id="new_room" placeholder="新房间号（纯数字）" style="width:200px">
 <button class="ghost" onclick="addRoom()">添加房间</button></div>
@@ -801,6 +841,10 @@ table.hits th{color:#9fb0d0;font-weight:600}
 <div class="row"><button onclick="saveRooms()">保存房间配置</button><span class="hint">保存后热加载，已有房间监控不中断</span></div>
 <div class="msg" id="msg_rooms"></div></div>
 
+<div class="pair-grid">
+<div class="card"><h2>命中记录 <span class="hint">（房间 / 发送者 / 内容）</span></h2>
+<table class="hits"><thead><tr><th>时间</th><th>房间</th><th>发送者</th><th>内容</th></tr></thead>
+<tbody id="hits_body"><tr><td colspan="4" class="hint">加载中…</td></tr></tbody></table></div>
 <div class="card"><h2>发送账号 <span class="hint">（最多 10 个，轮流发送）</span></h2>
 <div id="accts"></div>
 <div class="row"><input type="text" id="new_acct" placeholder="新账号名" style="width:200px">
@@ -810,7 +854,12 @@ table.hits th{color:#9fb0d0;font-weight:600}
 <div class="row"><label>账号</label><select id="login_acct"></select>
 <button onclick="genQR()">生成二维码</button><span class="hint" id="qr_status"></span></div>
 <img id="qrimg" alt="扫码二维码"><div class="msg" id="msg_login"></div></div></div>
+</div>
 
+<div class="pair-grid">
+<div class="card"><h2>最近日志</h2>
+<div class="row"><button class="ghost" onclick="loadStatus()">刷新</button></div>
+<div id="logs"></div></div>
 <div class="card"><h2>AI Key</h2>
 <div class="row"><label>调用模式</label><select id="f_aimode">
 <option value="relay">中继模式（走服务器保险库 Key）</option>
@@ -821,10 +870,7 @@ table.hits th{color:#9fb0d0;font-weight:600}
 <div class="row"><button onclick="saveAI()">保存 AI 设置</button></div>
 <div class="msg" id="msg_ai"></div>
 <div class="hint">中继模式优先，走下面填写的中继地址调用；切到直连模式会停用中继、改用上面填写的 Key。Key 仅保存不回显。改这里会重启机器人。</div></div>
-
-<div class="card"><h2>最近日志</h2>
-<div class="row"><button class="ghost" onclick="loadStatus()">刷新</button></div>
-<div id="logs"></div></div>
+</div>
 
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
@@ -897,7 +943,7 @@ function toggleRoom(i){rooms[i].enabled=rooms[i].enabled===false?true:false;rend
 document.getElementById('msg_rooms').textContent='已'+(rooms[i].enabled?'恢复':'暂停')+'（点"保存房间配置"后生效）';}
 function delRoom(i){if(rooms.length<=1){alert('至少保留一个房间');return;}rooms.splice(i,1);renderRooms();}
 async function saveRooms(){const m=document.getElementById('msg_rooms');m.textContent='保存中…';
-for(const r of rooms){if(!r.keywords.length){m.textContent=`房间 ${r.id} 至少要一个触发词`;return;}}
+
 try{const j=await api('/api/config',{method:'POST',body:JSON.stringify({rooms:rooms,
 model:document.getElementById('f_model').value.trim(),
 history_rounds:parseInt(document.getElementById('f_history').value)||0,
@@ -960,7 +1006,9 @@ loadStatus();setInterval(loadStatus,15000);
 // ---------- 实时监看 ----------
 let wPlayers={}, wInit=false, wSig='', wPendingRefresh={};
 function setWLayout(){const v=document.getElementById('w_layout').value;
+try{localStorage.setItem('w_layout',v);}catch(e){}
 const g=document.getElementById('w_grid');g.className='wgrid c'+v;}
+(function(){try{const v=localStorage.getItem('w_layout');if(v&&['1','2','3','4'].includes(v)){document.getElementById('w_layout').value=v;document.getElementById('w_grid').className='wgrid c'+v;}}catch(e){}})();
 async function ensureWUrl(rid){
 const now=Date.now();
 if(wPendingRefresh[rid]&&now-wPendingRefresh[rid]<180000)return;
@@ -993,15 +1041,76 @@ function focusWAudio(rid){
 document.querySelectorAll('#w_grid video').forEach(v=>{
 const id=v.id.slice(3);const on=(id===String(rid))&&v.muted;
 v.muted=!on;});}
+function setWVol(rid,val){
+const v=document.getElementById('wv_'+rid);
+if(v){v.volume=val/100;v.muted=(val==0);}}
+/* 弹幕：浏览器直连斗鱼 WSS + 飘屏，按房间独立开关 */
+const DM_EPS=[8501,8502,8503,8504,8505,8506].map(p=>'wss://danmuproxy.douyu.com:'+p+'/');
+function sttUnesc(v){return v.replace(/@S/g,'/').replace(/@A/g,'@');}
+function parseSTT(b){const d={};b.split('/').forEach(p=>{const i=p.indexOf('@=');if(i>0)d[p.slice(0,i)]=sttUnesc(p.slice(i+2));});return d;}
+function packSTT(s,pt){const e=new TextEncoder().encode(s);const bl=8+e.length+1;const bf=new ArrayBuffer(12+e.length+1);const dv=new DataView(bf);dv.setInt32(0,bl,true);dv.setInt32(4,bl,true);dv.setUint16(8,pt||689,true);new Uint8Array(bf).set(e,12);return bf;}
+function unpackSTT(bf){const out=[];const u8=new Uint8Array(bf);const dv=new DataView(bf);const td=new TextDecoder();let o=0;while(o+12<=u8.length){const bl=dv.getInt32(o,true),t=bl+4;if(bl<9||o+t>u8.length)break;out.push(td.decode(u8.subarray(o+12,o+t-1)));o=t;}return out;}
+const dmkConns={};
+function dmkSync(liveIds){
+Object.keys(dmkConns).forEach(id=>{if(liveIds.indexOf(id)<0)dmkDrop(id);});
+liveIds.forEach(id=>{if(!dmkConns[id])dmkDial(id);});}
+function dmkDial(rid){
+const st={eps:DM_EPS.slice().sort(()=>Math.random()-0.5),i:0,dead:false,ws:null,hb:0};
+dmkConns[rid]=st;
+function redial(){if(st.dead)return;clearInterval(st.hb);setTimeout(dial,5000);}
+function dial(){
+if(st.dead)return;
+let ws;try{ws=new WebSocket(st.eps[st.i++%st.eps.length]);}catch(e){redial();return;}
+st.ws=ws;ws.binaryType='arraybuffer';
+ws.onopen=()=>{try{ws.send(packSTT('type@=loginreq/roomid@='+rid+'/'));ws.send(packSTT('type@=joingroup/rid@='+rid+'/gid@=-9999/'));}catch(e){}
+st.hb=setInterval(()=>{try{ws.send(packSTT('type@=mrkl/'));}catch(e){}},40000);};
+ws.onmessage=ev=>{if(typeof ev.data==='string')return;
+try{unpackSTT(ev.data).forEach(b=>{if(b.indexOf('type@=')!==0)return;const d=parseSTT(b);
+if(d.type==='chatmsg'&&d.nn&&d.txt)dmkShow(rid,d.nn.trim(),d.txt.trim());});}catch(e){}};
+ws.onclose=redial;ws.onerror=()=>{try{ws.close();}catch(e){}};}
+dial();}
+function dmkDrop(rid){const st=dmkConns[rid];if(!st)return;st.dead=true;clearInterval(st.hb);try{st.ws&&st.ws.close();}catch(e){}delete dmkConns[rid];}
+function dmkOn(rid){try{return localStorage.getItem('wdmk_'+rid)!=='0';}catch(e){return true;}}
+function toggleDmk(rid){
+try{localStorage.setItem('wdmk_'+rid,dmkOn(rid)?'0':'1');}catch(e){}
+const layer=document.getElementById('wdmk_'+rid);
+if(layer&&!dmkOn(rid))layer.innerHTML='';
+const b=document.getElementById('wdb_'+rid);
+if(b){b.textContent=dmkOn(rid)?'弹幕开':'弹幕关';b.classList.toggle('off',!dmkOn(rid));}}
+async function sendWDanmaku(rid){
+const inp=document.getElementById('wsi_'+rid);const msg=document.getElementById('wmsg_'+rid);
+const text=(inp.value||'').trim();if(!text)return;
+inp.disabled=true;msg.textContent='发送中…';
+try{
+const j=await api('/api/send',{method:'POST',body:JSON.stringify({rid:String(rid),text:text})});
+if(j.ok){msg.textContent='✓ '+j.msg;inp.value='';}
+else{msg.textContent='✗ '+(j.error||j.msg||'失败');}
+}catch(e){msg.textContent='✗ '+e.message;}
+inp.disabled=false;
+setTimeout(()=>{if(msg.textContent)msg.textContent='';},5000);}
+function dmkShow(rid,nn,txt){
+if(!dmkOn(rid))return;
+const layer=document.getElementById('wdmk_'+rid);if(!layer)return;
+const rows=Math.max(3,Math.floor((layer.clientHeight||140)/28));
+layer._rr=((layer._rr||0)+1)%rows;
+const el=document.createElement('div');el.className='wdmk-it';
+el.style.top=(layer._rr*28)+'px';el.style.animationDuration='9s';
+el.textContent=nn+'：'+txt;layer.appendChild(el);
+el.addEventListener('animationend',()=>el.remove());
+while(layer.children.length>80)layer.firstChild.remove();}
 function renderWTiles(rooms){
 const g=document.getElementById('w_grid');
 g.innerHTML=rooms.length?rooms.map(r=>{
 const nm=r.owner||('房间 '+r.id);
 if(!r.live)return `<div class="wtile" id="wt_${r.id}"><div class="woff">${esc(nm)} · 未开播</div></div>`;
-return `<div class="wtile" id="wt_${r.id}" onclick="focusWAudio('${r.id}')">
-<video id="wv_${r.id}" playsinline></video>
+return `<div class="wtile" id="wt_${r.id}">
+<div class="wvid" onclick="focusWAudio('${r.id}')"><video id="wv_${r.id}" playsinline></video>
 <span class="wtag">${esc(nm)}</span><span class="wlive badge ok">直播中</span>
-<div class="werr"></div></div>`;}).join('')
+<div class="werr"></div>
+<div class="wvol" onclick="event.stopPropagation()" title="音量"><span>🔊</span><input type="range" min="0" max="100" value="100" oninput="setWVol('${r.id}',this.value)"></div>
+<div class="wdmk" id="wdmk_${r.id}"></div>
+<div class="wbtns" onclick="event.stopPropagation()"><button id="wdb_${r.id}" onclick="toggleDmk('${r.id}')" title="弹幕开关">弹幕开</button></div></div>
+<div class="wsend" onclick="event.stopPropagation()"><input id="wsi_${r.id}" maxlength="50" placeholder="发弹幕…" onkeydown="if(event.key==='Enter')sendWDanmaku('${r.id}')"><button onclick="sendWDanmaku('${r.id}')">发送</button><span class="wmsg" id="wmsg_${r.id}"></span></div></div>`;}).join('')
 :'<div class="hint">还没有房间，先在下方添加监控房间</div>';}
 function attachWPending(rooms){
 rooms.forEach(r=>{
@@ -1022,6 +1131,7 @@ if(jr.ok){wSig='';}}catch(e){}}}}
 const j=await api('/api/watch');
 const sig=j.rooms.map(r=>r.id+':'+(r.live?1:0)).join(',');
 if(sig!==wSig){wSig=sig;renderWTiles(j.rooms);}
+dmkSync(j.rooms.filter(r=>r.live).map(r=>String(r.id)));
 attachWPending(j.rooms);
 }catch(e){document.getElementById('msg_watch').textContent='监看加载失败：'+e.message;}
 }
