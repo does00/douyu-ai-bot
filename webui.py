@@ -33,6 +33,8 @@ ENV_FILE = ROOT / ".env"
 LOG_FILE = DATA / "bot.log"
 
 PORT = int(os.environ.get("WEBUI_PORT", "18021"))
+
+VERSION = "1.1.4"
 ADMIN_USER = "admin"
 RELAY_URL_DEFAULT = "http://127.0.0.1:18020/generate"
 
@@ -537,6 +539,7 @@ class Handler(BaseHTTPRequestHandler):
             "history_rounds": int(cfg.get("gemini", {}).get("history_rounds", 6)),
             "mention_prefix": cfg.get("triggers", {}).get("mention_prefix", "@AI"),
             "ai_mode": ai_mode(env),
+            "version": VERSION,
             "relay_url": env.get("GEMINI_RELAY_URL", RELAY_URL_DEFAULT),
             "proxy_url": env.get("PROXY_URL", ""),
             "key_hint": mask_key(env.get("GEMINI_API_KEY", "")),
@@ -941,7 +944,7 @@ const nLogin=s.accounts.filter(a=>a.logged_in).length;
 const roomNames=s.rooms.map(r=>r.owner||r.id).join('、');
 const nPaused=s.rooms.filter(r=>r.enabled===false).length;
 document.getElementById('st_detail').textContent=
-`${s.rooms.length} 个房间${nPaused?`（${nPaused} 已暂停）`:''}：${roomNames} · ${s.accounts.length} 个账号（${nLogin} 已登录）· 模型 ${s.model}`;
+`v${s.version||'?'} · ${s.rooms.length} 个房间${nPaused?`（${nPaused} 已暂停）`:''}：${roomNames} · ${s.accounts.length} 个账号（${nLogin} 已登录）· 模型 ${s.model}`;
 // 命中记录
 owners=s.owners||{};
 document.getElementById('hits_body').innerHTML=s.hits.length?s.hits.map(h=>{
@@ -1060,7 +1063,7 @@ const i=+e.target.id.slice(6);addKw(i);}});
 loadStatus();setInterval(loadStatus,15000);
 
 // ---------- 实时监看 ----------
-let wPlayers={}, wInit=false, wSig='', wPendingRefresh={};
+let wPlayers={}, wInit=false, wSig='', wPendingRefresh={}, wUrls={};
 function setWLayout(){const v=document.getElementById('w_layout').value;
 try{localStorage.setItem('w_layout',v);}catch(e){}
 const g=document.getElementById('w_grid');g.className='wgrid c'+v;}
@@ -1072,12 +1075,13 @@ wPendingRefresh[rid]=now;
 try{await api('/api/watch',{method:'POST',body:JSON.stringify({action:'refresh',rid:String(rid)})});}catch(e){}}
 async function setWQuality(){const q=document.getElementById('w_qn').value;
 try{await api('/api/watch',{method:'POST',body:JSON.stringify({action:'quality',quality:q})});
-Object.keys(wPlayers).forEach(destroyWPlayer);wPlayers={};wSig='';loadWatch();}catch(e){
+Object.keys(wPlayers).forEach(destroyWPlayer);wPlayers={};wUrls={};wSig='';loadWatch();}catch(e){
 document.getElementById('msg_watch').textContent='切换失败：'+e.message;}}
 function destroyWPlayer(rid){const p=wPlayers[rid];if(!p)return;
 try{if(p.destroy)p.destroy();}catch(e){}delete wPlayers[rid];}
 function attachWPlayer(rid,url,kind){
 const v=document.getElementById('wv_'+rid);if(!v)return;
+wUrls[rid]=url;
 destroyWPlayer(rid);
 const e0=document.querySelector('#wt_'+rid+' .werr');if(e0)e0.style.display='none';
 const onFatal=()=>{const e=document.querySelector('#wt_'+rid+' .werr');
@@ -1175,9 +1179,11 @@ return `<div class="wtile" id="wt_${r.id}">
 :'<div class="hint">还没有房间，先在下方添加监控房间</div>';}
 function attachWPending(rooms){
 rooms.forEach(r=>{
-if(!r.live||wPlayers[r.id])return;
-if(r.url){const v=document.getElementById('wv_'+r.id);
-if(v&&!v.src&&!v.currentSrc)attachWPlayer(r.id,r.url,r.kind);}
+if(!r.live)return;
+if(r.url){
+if(wUrls[r.id]!==r.url){destroyWPlayer(r.id);attachWPlayer(r.id,r.url,r.kind);}
+else if(!wPlayers[r.id]){const v=document.getElementById('wv_'+r.id);
+if(v&&!v.src&&!v.currentSrc)attachWPlayer(r.id,r.url,r.kind);}}
 else ensureWUrl(r.id);});}
 async function loadWatch(force){
 try{
