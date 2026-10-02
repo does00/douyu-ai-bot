@@ -538,6 +538,7 @@ class Handler(BaseHTTPRequestHandler):
             "mention_prefix": cfg.get("triggers", {}).get("mention_prefix", "@AI"),
             "ai_mode": ai_mode(env),
             "relay_url": env.get("GEMINI_RELAY_URL", RELAY_URL_DEFAULT),
+            "proxy_url": env.get("PROXY_URL", ""),
             "key_hint": mask_key(env.get("GEMINI_API_KEY", "")),
             "hits": recent_hits(30),
             "owners": get_owner_names(),
@@ -617,23 +618,46 @@ class Handler(BaseHTTPRequestHandler):
         mode = body.get("ai_mode")
         if mode not in ("relay", "direct"):
             return self._json({"error": "ai_mode 非法"}, 400)
+        env = read_env()
         updates = {}
         if mode == "relay":
             relay_url = str(body.get("relay_url", "")).strip() or RELAY_URL_DEFAULT
             if not relay_url.startswith(("http://", "https://")):
                 return self._json({"error": "中继地址须以 http:// 或 https:// 开头"}, 400)
-            updates["GEMINI_RELAY_URL"] = relay_url
+            if env.get("GEMINI_RELAY_URL") != relay_url:
+                updates["GEMINI_RELAY_URL"] = relay_url
         else:
             key = str(body.get("key", "")).strip()
-            env = read_env()
             if not key and not env.get("GEMINI_API_KEY"):
                 return self._json({"error": "直连模式需要填写 Gemini Key"}, 400)
             if key:
                 updates["GEMINI_API_KEY"] = key
-            updates["GEMINI_RELAY_URL"] = None  # 删除，走直连
-        write_env(updates)
-        ok, msg = svc_restart("douyu-ai-bot")
-        self._json({"ok": ok, "restart": msg, "ai_mode": mode})
+            if env.get("GEMINI_RELAY_URL"):
+                updates["GEMINI_RELAY_URL"] = None  # 删除，走直连
+        proxy_url = str(body.get("proxy_url", "")).strip()
+        if proxy_url and not proxy_url.startswith(("http://", "https://")):
+            return self._json({"error": "代理地址须以 http:// 或 https:// 开头"}, 400)
+        if (env.get("PROXY_URL") or "") != proxy_url:
+            updates["PROXY_URL"] = proxy_url if proxy_url else None
+        # 模型存 config.yaml（支持热加载）
+        model = str(body.get("model", "")).strip()
+        cfg_changed = False
+        if model:
+            cfg = load_bot_config()
+            if cfg.get("gemini", {}).get("model") != model:
+                cfg.setdefault("gemini", {})["model"] = model
+                save_bot_config(cfg)
+                cfg_changed = True
+        # .env 有改动才需重启；仅改模型走 SIGHUP 热加载
+        if updates:
+            write_env(updates)
+            ok, msg = svc_restart("douyu-ai-bot")
+            self._json({"ok": ok, "restart": msg, "ai_mode": mode})
+        elif cfg_changed:
+            ok = bot_apply_config()
+            self._json({"ok": ok, "restart": "配置已热加载" if ok else "热加载失败", "ai_mode": mode})
+        else:
+            self._json({"ok": True, "restart": "无改动", "ai_mode": mode})
 
     def _api_login_qr(self):
         from douyu_auth import QRLoginSession
@@ -856,7 +880,7 @@ table.hits th{color:#9fb0d0;font-weight:600}
 <button class="ghost" onclick="addRoom()">添加房间</button></div>
 <div class="row"><label>mention 前缀</label><input type="text" id="f_prefix" style="width:160px">
 <span class="hint">mention 模式下弹幕以此前缀开头才触发</span></div>
-<div class="row"><label>Gemini 模型</label><input type="text" id="f_model" style="width:260px">
+<div class="row">
 <label>对话记忆</label><input type="number" id="f_history" min="0" max="20" style="width:64px"><span class="hint">轮，0=关闭</span></div>
 <div class="row"><button onclick="saveRooms()">保存房间配置</button><span class="hint">保存后热加载，已有房间监控不中断</span></div>
 <div class="msg" id="msg_rooms"></div></div>
@@ -887,6 +911,15 @@ table.hits th{color:#9fb0d0;font-weight:600}
 <span class="hint" id="key_hint"></span></div>
 <div class="row"><label>Gemini Key</label><input type="password" id="f_key" placeholder="AIza…（留空则不修改）" style="width:260px"></div>
 <div class="row"><label>中继地址</label><input type="text" id="f_relayurl" placeholder="http://127.0.0.1:18020/generate" style="width:260px"></div>
+<div class="row"><label>代理地址</label><input type="text" id="f_proxyurl" placeholder="http://127.0.0.1:8080（直连 Gemini 需代理时填）" style="width:260px"></div>
+<div class="row"><label>Gemini 模型</label><select id="f_model" style="width:260px">
+<option value="gemini-3-flash-preview">gemini-3-flash-preview（推荐）</option>
+<option value="gemini-2.5-flash">gemini-2.5-flash</option>
+<option value="gemini-2.5-pro">gemini-2.5-pro</option>
+<option value="gemini-2.0-flash">gemini-2.0-flash</option>
+<option value="gemini-1.5-flash">gemini-1.5-flash</option>
+<option value="gemini-1.5-pro">gemini-1.5-pro</option>
+</select></div>
 <div class="row"><button onclick="saveAI()">保存 AI 设置</button></div>
 <div class="msg" id="msg_ai"></div>
 <div class="hint">中继模式优先，走下面填写的中继地址调用；切到直连模式会停用中继、改用上面填写的 Key。Key 仅保存不回显。改这里会重启机器人。</div></div>
@@ -927,6 +960,8 @@ document.getElementById('f_prefix').value=s.mention_prefix||'@AI助手';
 document.getElementById('f_aimode').value=s.ai_mode==='direct'?'direct':'relay';}
 if(!document.getElementById('f_relayurl').value){
 document.getElementById('f_relayurl').value=s.relay_url||'';}
+if(!document.getElementById('f_proxyurl').value){
+document.getElementById('f_proxyurl').value=s.proxy_url||'';}
 // 账号
 renderAccts(s.accounts);
 document.getElementById('key_hint').textContent='当前 Key：'+s.key_hint;
@@ -965,7 +1000,6 @@ function delRoom(i){if(rooms.length<=1){alert('至少保留一个房间');return
 async function saveRooms(){const m=document.getElementById('msg_rooms');m.textContent='保存中…';
 
 try{const j=await api('/api/config',{method:'POST',body:JSON.stringify({rooms:rooms,
-model:document.getElementById('f_model').value.trim(),
 history_rounds:parseInt(document.getElementById('f_history').value)||0,
 mention_prefix:document.getElementById('f_prefix').value.trim()})});
 m.textContent='已保存，'+(j.mode==='reload'?'配置已热加载（监控未中断）':'机器人重启'+(j.ok?'成功':'失败：'+j.restart));loadStatus();
@@ -991,7 +1025,9 @@ m.textContent='已删除，'+(j.mode==='reload'?'配置已热加载（监控未�
 async function saveAI(){const m=document.getElementById('msg_ai');m.textContent='保存中…';
 try{const j=await api('/api/ai',{method:'POST',body:JSON.stringify({
 ai_mode:document.getElementById('f_aimode').value,key:document.getElementById('f_key').value,
-relay_url:document.getElementById('f_relayurl').value.trim()})});
+relay_url:document.getElementById('f_relayurl').value.trim(),
+proxy_url:document.getElementById('f_proxyurl').value.trim(),
+model:document.getElementById('f_model').value})});
 document.getElementById('f_key').value='';
 m.textContent='已保存（'+(j.ai_mode==='relay'?'中继模式':'直连模式')+'），机器人重启'+(j.ok?'成功':'失败');
 loadStatus();}catch(e){m.textContent='失败：'+e.message;}}
