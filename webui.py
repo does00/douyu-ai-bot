@@ -287,6 +287,26 @@ def _douyu_request(method, url, **kw):
             _douyu_next_ok = time.time() + 55
 
 
+_douyu_stream_gate = threading.Lock()
+_douyu_stream_next_ok = 0.0
+def _douyu_stream_request(method, url, **kw):
+    """取流专用出口：独立 55s 限流，不被房间状态轮询阻塞。"""
+    global _douyu_stream_next_ok
+    with _douyu_stream_gate:
+        wait = _douyu_stream_next_ok - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        proxy = os.environ.get("PROXY_URL", "").strip()
+        kw.setdefault("proxies", {"http": proxy, "https": proxy} if proxy else {})
+        hdrs = kw.setdefault("headers", {})
+        hdrs.setdefault("User-Agent", UA_WEB)
+        kw.setdefault("timeout", 20)
+        try:
+            return requests.request(method, url, **kw)
+        finally:
+            _douyu_stream_next_ok = time.time() + 55
+
+
 def _douyu_stream_sign(rid, ts, key, rand_str, enc_time, is_special):
     f = rand_str
     for _ in range(enc_time):
@@ -306,7 +326,7 @@ def resolve_stream_url(rid, qn="超清"):
     last_err = "未知错误"
     for attempt in range(3):
         try:
-            r = _douyu_request(
+            r = _douyu_stream_request(
                 "GET",
                 f"https://www.douyu.com/wgapi/livenc/liveweb/websec/getEncryption?did={DOUYU_DID}")
             j = r.json()
@@ -324,7 +344,7 @@ def resolve_stream_url(rid, qn="超清"):
         auth = _douyu_stream_sign(str(rid), ts, d["key"], d["rand_str"],
                                   d["enc_time"], d["is_special"])
         try:
-            r = _douyu_request("POST", f"https://www.douyu.com/lapi/live/getH5PlayV1/{rid}", data={
+            r = _douyu_stream_request("POST", f"https://www.douyu.com/lapi/live/getH5PlayV1/{rid}", data={
                 "enc_data": d["enc_data"], "tt": str(ts), "did": DOUYU_DID, "auth": auth,
                 "cdn": "", "rate": WATCH_QN.get(qn, "4"),
                 "hevc": "0", "fa": "0", "ive": "0"})
@@ -1039,9 +1059,11 @@ p.attachMediaElement(v);p.load();
 const sv=getWVol(rid);v.volume=sv/100;v.muted=(sv==0);
 v.muted=true;v.play().catch(()=>{});}
 function focusWAudio(rid){
-document.querySelectorAll('#w_grid video').forEach(v=>{
-const id=v.id.slice(3);const on=(id===String(rid))&&v.muted;
-v.muted=!on;});}
+const v=document.getElementById('wv_'+rid);if(!v)return;
+if(!v.muted){v.muted=true;return;}
+document.querySelectorAll('#w_grid video').forEach(x=>{x.muted=true;});
+v.muted=false;
+if(v.volume===0){const sv=getWVol(rid);v.volume=(sv>0?sv:50)/100;}}
 function setWVol(rid,val){
 try{localStorage.setItem('wvol_'+rid,val);}catch(e){}
 const v=document.getElementById('wv_'+rid);
@@ -1097,7 +1119,7 @@ const layer=document.getElementById('wdmk_'+rid);if(!layer)return;
 const rows=Math.max(3,Math.floor((layer.clientHeight||140)/28));
 layer._rr=((layer._rr||0)+1)%rows;
 const el=document.createElement('div');el.className='wdmk-it';
-el.style.top=(layer._rr*28)+'px';el.style.animationDuration='9s';
+el.style.top=(layer._rr*28)+'px';el.style.animationDuration='15s';
 el.textContent=nn+'：'+txt;layer.appendChild(el);
 el.addEventListener('animationend',()=>el.remove());
 while(layer.children.length>80)layer.firstChild.remove();}
