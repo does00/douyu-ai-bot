@@ -42,6 +42,8 @@ PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 _pu = urlparse(PROXY_URL) if PROXY_URL else None
 WS_PROXY_KWARGS = ({"http_proxy_host": _pu.hostname, "http_proxy_port": _pu.port or 3128}
                    if _pu and _pu.hostname else {})
+# 斗鱼 WSS 的 TLS 握手在某些 OpenSSL 版本下失败，放宽证书校验
+WS_SSLOPT = {"cert_reqs": ssl.CERT_NONE}
 REQUESTS_PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else {}
 
 _stop = threading.Event()
@@ -268,7 +270,7 @@ class DanmakuReceiver(threading.Thread):
 
     def _serve(self, url: str):
         ws = websocket.create_connection(
-            url, timeout=50, **WS_PROXY_KWARGS,
+            url, timeout=50, sslopt=WS_SSLOPT, **WS_PROXY_KWARGS,
         )
         try:
             ws.send(pack_frame(recv_loginreq(self.room_id)))
@@ -345,7 +347,7 @@ class DanmakuSender:
             "User-Agent": UA,
         }
         ws = websocket.create_connection(
-            SEND_ENDPOINT, header=headers, timeout=10, **WS_PROXY_KWARGS,
+            SEND_ENDPOINT, header=headers, timeout=10, sslopt=WS_SSLOPT, **WS_PROXY_KWARGS,
         )
         try:
             ws.send(pack_frame(send_loginreq(room_id, f, devid)))
