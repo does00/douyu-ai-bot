@@ -34,7 +34,7 @@ LOG_FILE = DATA / "bot.log"
 
 PORT = int(os.environ.get("WEBUI_PORT", "18021"))
 
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 ADMIN_USER = "admin"
 RELAY_URL_DEFAULT = "http://127.0.0.1:18020/generate"
 
@@ -1100,10 +1100,8 @@ const sv=getWVol(rid);v.volume=sv/100;v.muted=(sv==0);
 v.muted=true;v.play().catch(()=>{});updateWMuteIcon(rid);}
 function focusWAudio(rid){
 const v=document.getElementById('wv_'+rid);if(!v)return;
-if(!v.muted){v.muted=true;updateWMuteIcon(rid);return;}
-document.querySelectorAll('#w_grid video').forEach(x=>{const id=x.id.replace('wv_','');x.muted=true;updateWMuteIcon(id);});
-v.muted=false;
-if(v.volume===0){const sv=getWVol(rid);v.volume=(sv>0?sv:50)/100;}
+v.muted=!v.muted;
+if(!v.muted&&v.volume===0){const sv=getWVol(rid);v.volume=(sv>0?sv:50)/100;}
 updateWMuteIcon(rid);}
 function updateWMuteIcon(rid){
 const v=document.getElementById('wv_'+rid);const ic=document.getElementById('wvic_'+rid);
