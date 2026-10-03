@@ -42,8 +42,9 @@ PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 _pu = urlparse(PROXY_URL) if PROXY_URL else None
 WS_PROXY_KWARGS = ({"http_proxy_host": _pu.hostname, "http_proxy_port": _pu.port or 3128}
                    if _pu and _pu.hostname else {})
-# 斗鱼 WSS 的 TLS 握手在某些 OpenSSL 版本下失败，放宽证书校验
-WS_SSLOPT = {"cert_reqs": ssl.CERT_NONE}
+# 斗鱼 WSS 的 TLS 握手在某些 OpenSSL 版本下失败：
+# CERT_NONE 跳过证书校验；强制 TLS1.2（部分网关对 TLS1.3 握手返回失败）
+WS_SSLOPT = {"cert_reqs": ssl.CERT_NONE, "ssl_version": ssl.PROTOCOL_TLSv1_2}
 REQUESTS_PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else {}
 
 _stop = threading.Event()
