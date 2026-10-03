@@ -116,6 +116,7 @@ class Account:
 
     def __init__(self, name: str, cookie_file: str):
         self.name = name
+        self._cooldown_until = 0.0  # 风控冷却到期时间
         self.cookie_file = ROOT / cookie_file if not os.path.isabs(cookie_file) else Path(cookie_file)
         # 兼容旧版：data/cookie.txt 继续用 data/devid.txt；新账号用同名 .devid.txt
         if self.cookie_file == DATA / "cookie.txt":
@@ -142,8 +143,15 @@ class Account:
                 or f.get("acf_uid", ""))
 
     def healthy(self):
+        if time.time() < self._cooldown_until:
+            return False  # 风控冷却中
         f = self.fields()
         return bool(f.get("acf_uid") and f.get("acf_dmjwt_token"))
+
+    def mark_risk(self, minutes: int = 10):
+        """网关登录被拒（风控/登录态过期）：冷却 N 分钟，期间不参与发送轮询。"""
+        self._cooldown_until = time.time() + minutes * 60
+        log(f"[account] {self.name} 进入风控冷却 {minutes} 分钟")
 
 
 # ---------- Gemini ----------
@@ -312,34 +320,34 @@ class DanmakuReceiver(threading.Thread):
 
 
 # ---------- 弹幕发送（多账号轮流） ----------
-class DanmakuSender:
-    """账号池发送：每个账号独立 cookie/devid，按轮询（round-robin）分配发送任务。
-    无可用账号 / 某账号登录态失效时自动跳过，保证不中断。"""
+class RiskControlError(RuntimeError):
+    """发送网关登录被拒（风控或登录态过期）。"""
 
-    def __init__(self, accounts):
-        self.accounts = accounts
-        self._rr = 0
+
+class SenderConn:
+    """单个账号到发送网关的长连接：懒建连，房间切换时重登录，
+    45 秒心跳保活，异常自动重建。线程安全。"""
+
+    HB_INTERVAL = 45
+
+    def __init__(self, account: "Account"):
+        self.account = account
+        self._ws = None
+        self._room_id = None
+        self._devid = ""
+        self._uid = ""
         self._lock = threading.Lock()
+        self._last_hb = 0.0
 
-    def _next_account(self):
-        healthy = [a for a in self.accounts if a.healthy()]
-        if not healthy:
-            return None
-        with self._lock:
-            acct = healthy[self._rr % len(healthy)]
-            self._rr += 1
-        return acct
-
-    def send(self, room_id: str, content: str):
-        acct = self._next_account()
-        if not acct:
-            return False, "无可用账号：请先在 WebUI 扫码登录"
+    def _open(self, room_id: str):
+        """建连并登录（调用方持有锁）。"""
+        acct = self.account
         cookie_raw = acct.cookie()
         f = parse_cookie_fields(cookie_raw)
         uid = f.get("acf_uid", "")
         jwt = f.get("acf_dmjwt_token", "")
         if not uid or not jwt:
-            return False, f"账号 {acct.name} 登录态缺少关键字段，请重新扫码"
+            raise RiskControlError(f"账号 {acct.name} 登录态缺少关键字段")
         devid = resolve_devid(cookie_raw, acct.devid_file)
         headers = {
             "Cookie": cookie_raw + "; dy_did=" + devid,
@@ -351,19 +359,115 @@ class DanmakuSender:
         )
         try:
             ws.send(pack_frame(send_loginreq(room_id, f, devid)))
-            loginres = self._recv_until(ws, "loginres", 6)
+            loginres = DanmakuSender._recv_until(ws, "loginres", 6)
             if not loginres or f"userid@={uid}" not in loginres:
-                return False, f"账号 {acct.name} 网关登录被拒（可能风控或登录态过期），请重新扫码"
-            ws.send(pack_frame(send_chatmessage(content, devid, uid)))
-            echo = self._recv_until(ws, "chatmsg", 3)
-            if echo:
-                return True, f"已发送（{acct.name}）"
-            return True, f"已提交（{acct.name}，公屏未回显，房间可能限制发言）"
-        finally:
+                raise RiskControlError(f"账号 {acct.name} 网关登录被拒")
+        except Exception:
             try:
                 ws.close()
             except Exception:
                 pass
+            raise
+        self._ws = ws
+        self._room_id = room_id
+        self._devid = devid
+        self._uid = uid
+        self._last_hb = time.time()
+
+    def _close(self):
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+            self._room_id = None
+
+    def _ensure(self, room_id: str):
+        """确保连接可用（调用方持有锁）。"""
+        now = time.time()
+        if self._ws is None or self._room_id != room_id:
+            self._close()
+            self._open(room_id)
+        elif now - self._last_hb > self.HB_INTERVAL:
+            try:
+                self._ws.send(pack_frame("type@=mrkl/"))
+                self._last_hb = now
+            except Exception:
+                self._close()
+                self._open(room_id)
+
+    def send(self, room_id: str, content: str):
+        with self._lock:
+            self._ensure(room_id)
+            try:
+                self._ws.send(pack_frame(send_chatmessage(content, self._devid, self._uid)))
+                echo = DanmakuSender._recv_until(self._ws, "chatmsg", 3)
+            except Exception:
+                self._close()
+                raise
+            if echo:
+                return True, f"已发送（{self.account.name}）"
+            return True, f"已提交（{self.account.name}，公屏未回显，房间可能限制发言）"
+
+
+class DanmakuSender:
+    """账号池发送：每个账号独立 cookie/devid，按轮询（round-robin）分配发送任务。
+    无可用账号 / 某账号登录态失效时自动跳过，保证不中断。"""
+
+    def __init__(self, accounts):
+        self.accounts = accounts
+        self._rr = 0
+        self._lock = threading.Lock()
+        self._conns = {}  # 账号名 -> SenderConn（长连接复用）
+
+    def _next_account(self):
+        healthy = [a for a in self.accounts if a.healthy()]
+        if not healthy:
+            return None
+        with self._lock:
+            acct = healthy[self._rr % len(healthy)]
+            self._rr += 1
+        return acct
+
+    def _conn_for(self, acct):
+        """取账号的长连接（懒创建；账号对象被热加载替换时重建）。"""
+        with self._lock:
+            conn = self._conns.get(acct.name)
+            if conn is None or conn.account is not acct:
+                if conn:
+                    conn._close()
+                conn = SenderConn(acct)
+                self._conns[acct.name] = conn
+            return conn
+
+    def update_accounts(self, new_accounts):
+        """SIGHUP 热加载：原地更新账号列表，保留同名账号的风控冷却，
+        关闭已删除账号的连接。"""
+        with self._lock:
+            old_by_name = {a.name: a for a in self.accounts}
+            now = time.time()
+            for na in new_accounts:
+                old = old_by_name.get(na.name)
+                if old and old._cooldown_until > now:
+                    na._cooldown_until = old._cooldown_until
+            self.accounts[:] = new_accounts
+            self._rr = 0
+            names = {a.name for a in new_accounts}
+            for name in list(self._conns):
+                if name not in names:
+                    self._conns.pop(name)._close()
+
+    def send(self, room_id: str, content: str):
+        acct = self._next_account()
+        if not acct:
+            return False, "无可用账号：请先在 WebUI 扫码登录"
+        conn = self._conn_for(acct)
+        try:
+            return conn.send(room_id, content)
+        except RiskControlError:
+            acct.mark_risk(10)
+            return False, f"账号 {acct.name} 网关登录被拒（可能风控或登录态过期），已冷却 10 分钟"
 
     @staticmethod
     def _recv_until(ws, want_type: str, timeout_s: float):
@@ -578,8 +682,7 @@ def apply_config():
         if sender_pool is None:
             sender_pool = DanmakuSender(new_accounts)
         else:
-            sender_pool.accounts[:] = new_accounts
-            sender_pool._rr = 0
+            sender_pool.update_accounts(new_accounts)
         state["my_names"] = {a.nickname() for a in new_accounts if a.nickname()}
     # Gemini 参数热更新（模型/人设/温度，无需重启）
     g = cfg.get("gemini", {})
@@ -603,6 +706,18 @@ def apply_config():
         log(f"[{tag}] [房间{rid}] 触发词: {m.keywords or state['mention_prefix']}（{m.mode}）")
 
 
+def smart_truncate(text: str, max_len: int) -> str:
+    """按句子边界截断：优先在句号/问号/感叹号处断开，避免拦腰砍断一句话。"""
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len]
+    for sep in ("。", "！", "？", ".", "!", "?", "…", "；", ";"):
+        idx = cut.rfind(sep)
+        if idx >= max_len // 2:
+            return cut[:idx + 1]
+    return cut + "…"
+
+
 def ai_worker():
     while not _stop.is_set():
         try:
@@ -618,7 +733,7 @@ def ai_worker():
         if reply:
             reply = reply.replace("\n", " ").strip()
             if len(reply) > state["max_reply"]:
-                reply = reply[:state["max_reply"]] + "…"
+                reply = smart_truncate(reply, state["max_reply"])
             remember(room_id, sdr, (q or text)[:80], reply)
             try:
                 send_q.put_nowait((room_id, sdr, reply, 0))
@@ -629,12 +744,24 @@ def ai_worker():
 def send_worker():
     last_send = 0.0
     max_attempts = 3
+    pending = []  # 延迟重试: [(最早发送时间, room_id, sdr, reply, attempt)]
     while not _stop.is_set():
-        try:
-            item = send_q.get(timeout=1)
-        except queue.Empty:
-            continue
-        room_id, sdr, reply, attempt = item if len(item) == 4 else (*item[:3], 0)
+        now = time.time()
+        # 到期的延迟重试优先处理，不再睡死整个 worker
+        due = [p for p in pending if p[0] <= now]
+        if due:
+            due.sort()
+            _, room_id, sdr, reply, attempt = due[0]
+            pending = [p for p in pending if p[0] > now] + due[1:]
+        else:
+            try:
+                item = send_q.get(timeout=1)
+            except queue.Empty:
+                if pending:
+                    nxt = min(p[0] for p in pending)
+                    time.sleep(max(0.1, min(nxt - now, 2)))
+                continue
+            room_id, sdr, reply, attempt = item if len(item) == 4 else (*item[:3], 0)
         wait = state["send_interval"] - (time.time() - last_send)
         if wait > 0:
             time.sleep(wait)
@@ -646,12 +773,9 @@ def send_worker():
             log(f"[send] [房间{room_id}] @{sdr}: {'OK' if ok else 'FAIL'} {msg}")
         except Exception as e:
             if attempt + 1 < max_attempts:
+                retry_at = time.time() + 60
                 log(f"[send] [房间{room_id}] 异常: {type(e).__name__} {str(e)[:80]}，60s 后重试({attempt + 2}/{max_attempts})")
-                try:
-                    send_q.put_nowait((room_id, sdr, reply, attempt + 1))
-                except queue.Full:
-                    log("[send] 队列满，丢弃该回复")
-                time.sleep(60)
+                pending.append((retry_at, room_id, sdr, reply, attempt + 1))
             else:
                 log(f"[send] [房间{room_id}] 异常: {type(e).__name__} {str(e)[:80]}，已达最大重试次数，丢弃")
         last_send = time.time()
