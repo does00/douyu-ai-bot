@@ -34,7 +34,7 @@ LOG_FILE = DATA / "bot.log"
 
 PORT = int(os.environ.get("WEBUI_PORT", "18021"))
 
-VERSION = "1.1.7"
+VERSION = "1.1.8"
 ADMIN_USER = "admin"
 RELAY_URL_DEFAULT = "http://127.0.0.1:18020/generate"
 
