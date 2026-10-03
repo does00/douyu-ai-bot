@@ -34,7 +34,7 @@ LOG_FILE = DATA / "bot.log"
 
 PORT = int(os.environ.get("WEBUI_PORT", "18021"))
 
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 ADMIN_USER = "admin"
 RELAY_URL_DEFAULT = "http://127.0.0.1:18020/generate"
 
@@ -1097,17 +1097,22 @@ p.on(flvjs.Events.ERROR,()=>onFatal());
 p.attachMediaElement(v);p.load();
 }else{v.src=url;}
 const sv=getWVol(rid);v.volume=sv/100;v.muted=(sv==0);
-v.muted=true;v.play().catch(()=>{});}
+v.muted=true;v.play().catch(()=>{});updateWMuteIcon(rid);}
 function focusWAudio(rid){
 const v=document.getElementById('wv_'+rid);if(!v)return;
-if(!v.muted){v.muted=true;return;}
-document.querySelectorAll('#w_grid video').forEach(x=>{x.muted=true;});
+if(!v.muted){v.muted=true;updateWMuteIcon(rid);return;}
+document.querySelectorAll('#w_grid video').forEach(x=>{const id=x.id.replace('wv_','');x.muted=true;updateWMuteIcon(id);});
 v.muted=false;
-if(v.volume===0){const sv=getWVol(rid);v.volume=(sv>0?sv:50)/100;}}
+if(v.volume===0){const sv=getWVol(rid);v.volume=(sv>0?sv:50)/100;}
+updateWMuteIcon(rid);}
+function updateWMuteIcon(rid){
+const v=document.getElementById('wv_'+rid);const ic=document.getElementById('wvic_'+rid);
+if(ic)ic.textContent=(v&&!v.muted&&v.volume>0)?'🔊':'🔇';}
 function setWVol(rid,val){
 try{localStorage.setItem('wvol_'+rid,val);}catch(e){}
 const v=document.getElementById('wv_'+rid);
-if(v){v.volume=val/100;v.muted=(val==0);}}
+if(v){v.volume=val/100;v.muted=(val==0);}
+updateWMuteIcon(rid);}
 function getWVol(rid){try{const v=localStorage.getItem('wvol_'+rid);if(v!==null)return Math.max(0,Math.min(100,parseInt(v)||0));}catch(e){}return 100;}
 /* 弹幕：浏览器直连斗鱼 WSS + 飘屏，按房间独立开关 */
 const DM_EPS=[8501,8502,8503,8504,8505,8506].map(p=>'wss://danmuproxy.douyu.com:'+p+'/');
@@ -1172,7 +1177,7 @@ return `<div class="wtile" id="wt_${r.id}">
 <div class="wvid" onclick="focusWAudio('${r.id}')"><video id="wv_${r.id}" playsinline></video>
 <span class="wtag">${esc(nm)}</span><span class="wlive badge ok">直播中</span>
 <div class="werr"></div>
-<div class="wvol" onclick="event.stopPropagation()" title="音量"><span>🔊</span><input type="range" min="0" max="100" value="${getWVol(r.id)}" oninput="setWVol('${r.id}',this.value)"></div>
+<div class="wvol" onclick="event.stopPropagation()" title="音量"><span id="wvic_${r.id}">🔊</span><input type="range" min="0" max="100" value="${getWVol(r.id)}" oninput="setWVol('${r.id}',this.value)"></div>
 <div class="wdmk" id="wdmk_${r.id}"></div>
 <div class="wbtns" onclick="event.stopPropagation()"><button id="wdb_${r.id}" onclick="toggleDmk('${r.id}')" title="弹幕开关">弹幕开</button></div></div>
 <div class="wsend" onclick="event.stopPropagation()"><input id="wsi_${r.id}" maxlength="50" placeholder="发弹幕…" onkeydown="if(event.key==='Enter')sendWDanmaku('${r.id}')"><button onclick="sendWDanmaku('${r.id}')">发送</button><span class="wmsg" id="wmsg_${r.id}"></span></div></div>`;}).join('')
